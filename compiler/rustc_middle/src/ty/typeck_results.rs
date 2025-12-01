@@ -259,7 +259,16 @@ impl<'tcx> TypeckResults<'tcx> {
     /// Returns the final resolution of a `QPath` in an `Expr` or `Pat` node.
     pub fn qpath_res(&self, qpath: &hir::QPath<'_>, id: HirId) -> Res {
         match *qpath {
-            hir::QPath::Resolved(_, path) => path.res,
+            hir::QPath::Resolved(_, path) => {
+                // For inferred paths (`.Variant` syntax), check type_dependent_defs first
+                // since the resolution was determined during type checking
+                if path.res == Res::Infer {
+                    self.type_dependent_def(id)
+                        .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id))
+                } else {
+                    path.res
+                }
+            }
             hir::QPath::TypeRelative(..) => self
                 .type_dependent_def(id)
                 .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)),

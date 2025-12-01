@@ -216,7 +216,14 @@ impl<'a> Parser<'a> {
         let lo = self.token.span;
         let mut segments = ThinVec::new();
         let mod_sep_ctxt = self.token.span.ctxt();
-        if self.eat_path_sep() {
+        if self.eat(exp!(Dot)) {
+            segments.push(PathSegment::infer_root(lo.with_ctxt(mod_sep_ctxt)));
+
+            // Special case for `.{ ... }` and `.( ... )`
+            if self.check(exp!(OpenBrace)) || self.check(exp!(OpenParen)) {
+                return Ok(Path { segments, span: lo.to(self.prev_token.span), tokens: None });
+            }
+        } else if self.eat_path_sep() {
             segments.push(PathSegment::path_root(lo.shrink_to_lo().with_ctxt(mod_sep_ctxt)));
         }
         self.parse_path_segments(&mut segments, style, ty_generics)?;

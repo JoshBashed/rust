@@ -577,10 +577,11 @@ impl PathSource<'_, '_, '_> {
                     _,
                 ) | Res::Local(..)
                     | Res::SelfCtor(..)
+                    | Res::Infer
             ),
             PathSource::Pat => {
                 res.expected_in_unit_struct_pat()
-                    || matches!(res, Res::Def(DefKind::Const | DefKind::AssocConst, _))
+                    || matches!(res, Res::Def(DefKind::Const | DefKind::AssocConst, _) | Res::Infer)
             }
             PathSource::TupleStruct(..) => res.expected_in_tuple_struct_pat(),
             PathSource::Struct(_) => matches!(
@@ -594,6 +595,7 @@ impl PathSource<'_, '_, '_> {
                     _,
                 ) | Res::SelfTyParam { .. }
                     | Res::SelfTyAlias { .. }
+                    | Res::Infer
             ),
             PathSource::TraitItem(ns, _) => match res {
                 Res::Def(DefKind::AssocConst | DefKind::AssocFn, _) if ns == ValueNS => true,

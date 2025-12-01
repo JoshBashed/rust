@@ -307,6 +307,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             | Res::SelfTyParam { .. }
             | Res::SelfTyAlias { .. }
             | Res::SelfCtor(..)
+            | Res::Infer
             | Res::Err => bug!("unexpected resolution: {:?}", res),
         }
     }

@@ -795,12 +795,124 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    pub(crate) fn check_infer_path_inner(
+        &self,
+        qpath: &QPath<'tcx>,
+        path: &rustc_hir::Path<'tcx>,
+        additional_segment: Option<&rustc_hir::PathSegment<'tcx>>,
+        qself_ty_hir: Option<&'tcx rustc_hir::Ty<'tcx>>,
+        hir_id: HirId,
+        expected: Option<Ty<'tcx>>,
+    ) -> Result<Option<(&'tcx ty::VariantDef, Ty<'tcx>)>, ErrorGuaranteed> {
+        let path_span = qpath.span();
+
+        if path.res != Res::Infer {
+            return Ok(None);
+        }
+
+        // Get the variant name from path segments.
+        //
+        // If additional_segment is present, it means that the path was TypeRelative, and we should
+        // use the additional segment as the variant name.
+        let variant_ident = if let Some(additional_segment) = additional_segment {
+            Some(additional_segment.ident)
+        } else {
+            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot).map(|seg| seg.ident)
+        };
+
+        let Some(expected_ty) = expected else {
+            let err = self.dcx().span_err(path_span, "cannot infer type; type annotation required");
+            if let Some(qself_ty_hir) = qself_ty_hir {
+                self.write_ty(qself_ty_hir.hir_id, Ty::new_error(self.tcx, err));
+            }
+            return Err(err);
+        };
+
+        let expected_ty = self.try_structurally_resolve_type(path_span, expected_ty);
+
+        if let Some(qself_ty_hir) = qself_ty_hir {
+            self.write_ty(qself_ty_hir.hir_id, expected_ty);
+        }
+
+        // Needs to be an ADT
+        let Some(adt_def) = expected_ty.ty_adt_def() else {
+            return Err(self.dcx().span_err(
+                path_span,
+                format!("expected struct or enum type for inferred path, found `{}`", expected_ty),
+            ));
+        };
+
+        let Some(ident) = variant_ident else {
+            // In this case, it's meant to be `.{ ... }`
+            if !adt_def.is_struct() {
+                return Err(self.dcx().span_err(
+                    path_span,
+                    format!("expected struct type for inferred path, found `{}`", expected_ty),
+                ));
+            }
+            self.write_resolution(hir_id, Ok((DefKind::Struct, adt_def.did())));
+
+            return Ok(Some((adt_def.non_enum_variant(), expected_ty)));
+        };
+
+        if adt_def.is_enum() {
+            let variant = adt_def.variants().iter().find(|v| v.name == ident.name);
+            let Some(variant) = variant else {
+                return Err(self.dcx().span_err(
+                    path_span,
+                    format!("no variant named `{}` found for enum `{}`", ident.name, expected_ty),
+                ));
+            };
+            self.write_resolution(hir_id, Ok((DefKind::Variant, variant.def_id)));
+
+            return Ok(Some((variant, expected_ty)));
+        }
+
+        Err(self.dcx().span_err(
+            path_span,
+            format!("expected enum type for inferred path, found `{}`", expected_ty),
+        ))
+    }
+
+    pub(crate) fn check_infer_path(
+        &self,
+        qpath: &QPath<'tcx>,
+        hir_id: HirId,
+        expected: Option<Ty<'tcx>>,
+    ) -> Result<Option<(&'tcx ty::VariantDef, Ty<'tcx>)>, ErrorGuaranteed> {
+        match qpath {
+            QPath::Resolved(_, path) => {
+                self.check_infer_path_inner(qpath, path, None, None, hir_id, expected)
+            }
+            QPath::TypeRelative(qself_ty, segment) => {
+                let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = qself_ty.kind else {
+                    return Ok(None);
+                };
+                self.check_infer_path_inner(
+                    qpath,
+                    path,
+                    Some(segment),
+                    Some(qself_ty),
+                    hir_id,
+                    expected,
+                )
+            }
+        }
+    }
+
     pub(crate) fn check_struct_path(
         &self,
         qpath: &QPath<'tcx>,
         hir_id: HirId,
+        expected: Option<Ty<'tcx>>,
     ) -> Result<(&'tcx ty::VariantDef, Ty<'tcx>), ErrorGuaranteed> {
         let path_span = qpath.span();
+
+        let infer_result = self.check_infer_path(qpath, hir_id, expected)?;
+        if let Some(inferred) = infer_result {
+            return Ok(inferred);
+        }
+
         let (def, ty) = self.finish_resolving_struct_path(qpath, path_span, hir_id);
         let variant = match def {
             Res::Err => {
@@ -808,6 +920,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     self.dcx().span_delayed_bug(path_span, "`Res::Err` but no error emitted");
                 self.set_tainted_by_errors(guar);
                 return Err(guar);
+            }
+            Res::Infer => {
+                // This case should not be reached due to the early return above
+                unreachable!("Res::Infer should have been handled above");
             }
             Res::Def(DefKind::Variant, _) => match ty.normalized.ty_adt_def() {
                 Some(adt) => {

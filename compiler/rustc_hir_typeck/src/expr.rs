@@ -287,7 +287,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // Intercept the callee path expr and give it better spans.
             hir::ExprKind::Path(
                 qpath @ (hir::QPath::Resolved(..) | hir::QPath::TypeRelative(..)),
-            ) => self.check_expr_path(qpath, expr, call_expr_and_args),
+            ) => self.check_expr_path(qpath, expr, call_expr_and_args, expected),
             _ => self.check_expr_kind(expr, expected),
         });
         let ty = self.resolve_vars_if_possible(ty);
@@ -554,7 +554,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ExprKind::AddrOf(kind, mutbl, oprnd) => {
                 self.check_expr_addr_of(kind, mutbl, oprnd, expected, expr)
             }
-            ExprKind::Path(ref qpath) => self.check_expr_path(qpath, expr, None),
+            ExprKind::Path(ref qpath) => self.check_expr_path(qpath, expr, None, expected),
             ExprKind::InlineAsm(asm) => {
                 // We defer some asm checks as we may not have resolved the input and output types yet (they may still be infer vars).
                 self.deferred_asm_checks.borrow_mut().push((asm, expr.hir_id));
@@ -754,13 +754,152 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    fn check_infer_expr_path_inner(
+        &self,
+        path: &hir::Path<'tcx>,
+        qself_ty_hir: Option<&'tcx hir::Ty<'tcx>>,
+        additional_segment: Option<&hir::PathSegment<'tcx>>,
+        expr: &'tcx hir::Expr<'tcx>,
+        expected: Expectation<'tcx>,
+    ) -> Result<Option<Ty<'tcx>>, ErrorGuaranteed> {
+        if path.res != Res::Infer {
+            return Ok(None);
+        }
+
+        let Some(expected_ty) = expected.only_has_type(self) else {
+            let err = self
+                .dcx()
+                .span_err(expr.span, format!("cannot infer type; provide a type annotation"));
+            if let Some(qself_ty_hir) = qself_ty_hir {
+                self.write_ty(qself_ty_hir.hir_id, Ty::new_error(self.tcx, err));
+            }
+            return Err(err);
+        };
+        let expected_ty = self.try_structurally_resolve_type(expr.span, expected_ty);
+
+        let Some(adt_def) = expected_ty.ty_adt_def() else {
+            return Err(self.dcx().span_err(
+                expr.span,
+                format!("expected enum or struct type, found `{}`", expected_ty),
+            ));
+        };
+
+        if adt_def.is_struct() {
+            return Ok(Some(expected_ty));
+        } else if !adt_def.is_enum() {
+            return Err(self.dcx().span_err(
+                expr.span,
+                format!("expected enum or struct type, found `{}`", expected_ty),
+            ));
+        }
+
+        // Get the variant name from path segments.
+        //
+        // If additional_segment is present, it means that the path was TypeRelative, and we should
+        // use the additional segment as the variant name.
+        let variant_ident = if let Some(additional_segment) = additional_segment {
+            Some(additional_segment.ident)
+        } else {
+            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot).map(|seg| seg.ident)
+        };
+
+        let Some(variant_ident) = variant_ident else {
+            // It might be a struct with tuple struct constructor syntax.
+            if let Some(qself_ty_hir) = qself_ty_hir {
+                let err = self.dcx().span_err(expr.span, "expected variant name after `.`");
+                self.write_ty(qself_ty_hir.hir_id, Ty::new_error(self.tcx, err));
+                return Err(err);
+            }
+
+            return Err(self.dcx().span_err(expr.span, "expected variant name after `.`"));
+        };
+
+        // Write the node type for the qself_ty if present (for TypeRelative paths)
+        // Used later for privacy checking
+        if let Some(qself_ty_hir) = qself_ty_hir {
+            self.write_ty(qself_ty_hir.hir_id, expected_ty);
+        }
+
+        if !adt_def.is_enum() {
+            return Err(self.dcx().span_err(
+                expr.span,
+                format!(
+                    "expected enum type for `.{}`, found {:?} `{}`",
+                    variant_ident,
+                    adt_def.adt_kind(),
+                    expected_ty
+                ),
+            ));
+        }
+
+        let Some(variant) = adt_def.variants().iter().find(|v| v.name == variant_ident.name) else {
+            return Err(self.dcx().span_err(
+                variant_ident.span,
+                format!("no variant named `{}` found for enum `{}`", variant_ident, expected_ty),
+            ));
+        };
+
+        if variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Const) {
+            let Some(ctor_def_id) = variant.ctor_def_id() else {
+                span_bug!(
+                    variant_ident.span,
+                    "expected variant `{}` to have a ctor",
+                    variant_ident
+                );
+            };
+            self.write_resolution(
+                expr.hir_id,
+                Ok((DefKind::Ctor(rustc_hir::def::CtorOf::Variant, CtorKind::Const), ctor_def_id)),
+            );
+            return Ok(Some(expected_ty));
+        }
+
+        Err(self.dcx().span_err(
+            expr.span,
+            format!("expected unit variant, found tuple or struct variant `{}`", variant_ident),
+        ))
+    }
+
+    fn check_infer_expr_path(
+        &self,
+        qpath: &'tcx hir::QPath<'tcx>,
+        expr: &'tcx hir::Expr<'tcx>,
+        expected: Expectation<'tcx>,
+    ) -> Result<Option<Ty<'tcx>>, ErrorGuaranteed> {
+        match qpath {
+            hir::QPath::Resolved(_, path) => {
+                self.check_infer_expr_path_inner(path, None, None, expr, expected)
+            }
+            hir::QPath::TypeRelative(qself_ty, segment) => {
+                if let hir::TyKind::Path(hir::QPath::Resolved(None, path)) = qself_ty.kind {
+                    return self.check_infer_expr_path_inner(
+                        path,
+                        Some(qself_ty),
+                        Some(segment),
+                        expr,
+                        expected,
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) fn check_expr_path(
         &self,
         qpath: &'tcx hir::QPath<'tcx>,
         expr: &'tcx hir::Expr<'tcx>,
         call_expr_and_args: Option<(&'tcx hir::Expr<'tcx>, &'tcx [hir::Expr<'tcx>])>,
+        expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let tcx = self.tcx;
+
+        // Handle inferred variant syntax (e.g., `.Bar` for enum variants)
+        match self.check_infer_expr_path(qpath, expr, expected) {
+            Ok(Some(ty)) => return ty,
+            Ok(None) => {}
+            Err(guar) => return Ty::new_error(tcx, guar),
+        }
 
         if let Some((_, [arg])) = call_expr_and_args
             && let QPath::Resolved(_, path) = qpath
@@ -2024,7 +2163,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         base_expr: &'tcx hir::StructTailExpr<'tcx>,
     ) -> Ty<'tcx> {
         // Find the relevant variant
-        let (variant, adt_ty) = match self.check_struct_path(qpath, expr.hir_id) {
+        let expected_ty = expected.only_has_type(self);
+        let (variant, adt_ty) = match self.check_struct_path(qpath, expr.hir_id, expected_ty) {
             Ok(data) => data,
             Err(guar) => {
                 self.check_struct_fields_on_error(fields, base_expr);

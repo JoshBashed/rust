@@ -2117,6 +2117,13 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     .span_delayed_bug(path.span, "path with `Res::Err` but no error emitted");
                 Ty::new_error(tcx, e)
             }
+            Res::Infer => {
+                let e = self
+                    .tcx()
+                    .dcx()
+                    .span_err(path.span, "cannot infer type; provide a type annotation");
+                Ty::new_error(tcx, e)
+            }
             Res::Def(..) => {
                 assert_eq!(
                     path.segments.get(0).map(|seg| seg.ident.name),
@@ -2362,6 +2369,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             | Res::Local(_)
             | Res::ToolMod
             | Res::NonMacroAttr(_)
+            | Res::Infer
             | Res::Err) => Const::new_error_with_message(
                 tcx,
                 span,

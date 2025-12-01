@@ -239,6 +239,10 @@ impl PathSegment {
         PathSegment { ident, id: DUMMY_NODE_ID, args: None }
     }
 
+    pub fn infer_root(span: Span) -> Self {
+        PathSegment::from_ident(Ident::new(kw::InferRoot, span))
+    }
+
     pub fn path_root(span: Span) -> Self {
         PathSegment::from_ident(Ident::new(kw::PathRoot, span))
     }

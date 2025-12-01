@@ -1806,6 +1806,14 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         module = Some(ModuleOrUniformRoot::Module(crate_root));
                         continue;
                     }
+                    if name == kw::InferRoot {
+                        // `.Variant`, `.{ ... }`, or `.( ... )`
+                        let unresolved_segments = path.len() - 1;
+                        return PathResult::NonModule(PartialRes::with_unresolved_segments(
+                            Res::Infer,
+                            unresolved_segments,
+                        ));
+                    }
                 }
             }
 

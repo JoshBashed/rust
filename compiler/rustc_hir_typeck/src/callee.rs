@@ -62,6 +62,28 @@ enum CallStep<'tcx> {
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
+    /// Check if a QPath is an inferred path (uses Res::Infer).
+    fn is_infer_qpath(qpath: &hir::QPath<'_>) -> bool {
+        match qpath {
+            hir::QPath::Resolved(_, path) => path.res == Res::Infer,
+            hir::QPath::TypeRelative(qself_ty, _) => {
+                matches!(qself_ty.kind, hir::TyKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Infer)
+            }
+        }
+    }
+
+    /// Get the variant ident from an inferred QPath.
+    fn get_infer_variant_ident(qpath: &hir::QPath<'_>) -> Option<rustc_span::symbol::Ident> {
+        match qpath {
+            hir::QPath::Resolved(_, path) => path
+                .segments
+                .iter()
+                .find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+                .map(|seg| seg.ident),
+            hir::QPath::TypeRelative(_, segment) => Some(segment.ident),
+        }
+    }
+
     pub(crate) fn check_expr_call(
         &self,
         call_expr: &'tcx hir::Expr<'tcx>,
@@ -69,6 +91,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
+        if let hir::ExprKind::Path(qpath) = &callee_expr.kind
+            && Self::is_infer_qpath(qpath)
+        {
+            if let Some(result) =
+                self.check_infer_call(call_expr, callee_expr, qpath, arg_exprs, expected)
+            {
+                return result;
+            }
+        }
+
         let original_callee_ty = match &callee_expr.kind {
             hir::ExprKind::Path(hir::QPath::Resolved(..) | hir::QPath::TypeRelative(..)) => self
                 .check_expr_with_expectation_and_args(
@@ -148,6 +180,109 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         );
 
         output
+    }
+
+    fn check_infer_call(
+        &self,
+        call_expr: &'tcx hir::Expr<'tcx>,
+        callee_expr: &'tcx hir::Expr<'tcx>,
+        qpath: &'tcx hir::QPath<'tcx>,
+        arg_exprs: &'tcx [hir::Expr<'tcx>],
+        expected: Expectation<'tcx>,
+    ) -> Option<Ty<'tcx>> {
+        let tcx = self.tcx;
+
+        let variant_ident = Self::get_infer_variant_ident(qpath);
+        let expected_ty = expected.only_has_type(self)?;
+        let expected_ty = self.try_structurally_resolve_type(call_expr.span, expected_ty);
+
+        let adt_def = expected_ty.ty_adt_def()?;
+
+        if variant_ident.is_none() && adt_def.is_struct() {
+            let variant = adt_def.non_enum_variant();
+            let (CtorKind::Fn, ctor_def_id) = variant.ctor? else {
+                self.dcx().span_err(
+                    callee_expr.span,
+                    format!("expected tuple struct, found `{}`", expected_ty),
+                );
+                return Some(Ty::new_misc_error(tcx));
+            };
+
+            self.write_resolution(
+                callee_expr.hir_id,
+                Ok((def::DefKind::Ctor(def::CtorOf::Struct, CtorKind::Fn), ctor_def_id)),
+            );
+
+            let args = match expected_ty.kind() {
+                ty::Adt(_, args) => *args,
+                _ => return None,
+            };
+
+            let callee_ty = Ty::new_fn_def(tcx, ctor_def_id, args);
+            self.write_ty(callee_expr.hir_id, callee_ty);
+            self.write_args(callee_expr.hir_id, args);
+
+            return Some(self.confirm_builtin_call(
+                call_expr,
+                callee_expr,
+                callee_ty,
+                arg_exprs,
+                expected,
+            ));
+        }
+
+        let variant_ident = variant_ident?;
+        if !adt_def.is_enum() {
+            self.dcx()
+                .span_err(variant_ident.span, format!("expected enum, found `{}`", expected_ty));
+            return Some(Ty::new_misc_error(tcx));
+        }
+        let variant = adt_def.variants().iter().find(|v| v.name == variant_ident.name);
+        let Some(variant) = variant else {
+            self.dcx().span_err(
+                variant_ident.span,
+                format!("no variant named `{}` found for enum `{}`", variant_ident, expected_ty),
+            );
+            return Some(Ty::new_misc_error(tcx));
+        };
+
+        if !variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Fn) {
+            self.dcx().span_err(
+                callee_expr.span,
+                format!(
+                    "expected tuple variant constructor, found unit or struct variant `{}`",
+                    variant_ident
+                ),
+            );
+            return Some(Ty::new_misc_error(tcx));
+        }
+
+        let Some(ctor_def_id) = variant.ctor_def_id() else {
+            span_bug!(callee_expr.span, "expected tuple variant to have a constructor def id");
+        };
+        self.write_resolution(
+            callee_expr.hir_id,
+            Ok((def::DefKind::Ctor(def::CtorOf::Variant, CtorKind::Fn), ctor_def_id)),
+        );
+
+        if let hir::QPath::TypeRelative(qself_ty, _) = qpath {
+            self.write_ty(qself_ty.hir_id, expected_ty);
+        }
+
+        let ctor_fn_sig = tcx.fn_sig(ctor_def_id);
+        let args = match expected_ty.kind() {
+            ty::Adt(_, args) => *args,
+            _ => return None,
+        };
+
+        let fn_sig = ctor_fn_sig.instantiate(tcx, args);
+        let _fn_sig = tcx.liberate_late_bound_regions(self.body_id.into(), fn_sig);
+
+        let callee_ty = Ty::new_fn_def(tcx, ctor_def_id, args);
+        self.write_ty(callee_expr.hir_id, callee_ty);
+        self.write_args(callee_expr.hir_id, args);
+
+        Some(self.confirm_builtin_call(call_expr, callee_expr, callee_ty, arg_exprs, expected))
     }
 
     /// Can a function with this ABI be called with a rust call expression?

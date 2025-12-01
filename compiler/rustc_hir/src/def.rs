@@ -618,6 +618,8 @@ pub enum Res<Id = hir::HirId> {
     NonMacroAttr(NonMacroAttrKind), // e.g., `#[inline]` or `#[rustfmt::skip]`
 
     // All namespaces
+    Infer,
+
     /// Name resolution failed. We use a dummy `Res` variant so later phases
     /// of the compiler won't crash and can instead report more errors.
     ///
@@ -858,6 +860,7 @@ impl<Id> Res<Id> {
             | Res::SelfCtor(..)
             | Res::ToolMod
             | Res::NonMacroAttr(..)
+            | Res::Infer
             | Res::Err => None,
         }
     }
@@ -889,6 +892,7 @@ impl<Id> Res<Id> {
             Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } => "self type",
             Res::ToolMod => "tool module",
             Res::NonMacroAttr(attr_kind) => attr_kind.descr(),
+            Res::Infer => "inferred type member",
             Res::Err => "unresolved item",
         }
     }
@@ -898,7 +902,7 @@ impl<Id> Res<Id> {
         match *self {
             Res::Def(kind, _) => kind.article(),
             Res::NonMacroAttr(kind) => kind.article(),
-            Res::Err => "an",
+            Res::Infer | Res::Err => "an",
             _ => "a",
         }
     }
@@ -915,6 +919,7 @@ impl<Id> Res<Id> {
             }
             Res::ToolMod => Res::ToolMod,
             Res::NonMacroAttr(attr_kind) => Res::NonMacroAttr(attr_kind),
+            Res::Infer => Res::Infer,
             Res::Err => Res::Err,
         }
     }
@@ -931,6 +936,7 @@ impl<Id> Res<Id> {
             }
             Res::ToolMod => Res::ToolMod,
             Res::NonMacroAttr(attr_kind) => Res::NonMacroAttr(attr_kind),
+            Res::Infer => Res::Infer,
             Res::Err => Res::Err,
         })
     }
@@ -960,7 +966,7 @@ impl<Id> Res<Id> {
             }
             Res::SelfCtor(..) | Res::Local(..) => Some(Namespace::ValueNS),
             Res::NonMacroAttr(..) => Some(Namespace::MacroNS),
-            Res::Err => None,
+            Res::Infer | Res::Err => None,
         }
     }
 

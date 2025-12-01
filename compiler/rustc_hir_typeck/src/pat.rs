@@ -8,7 +8,7 @@ use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, ErrorGuaranteed, MultiSpan, pluralize, struct_span_code_err,
 };
-use rustc_hir::def::{CtorKind, DefKind, Res};
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_hir::{
@@ -304,9 +304,27 @@ struct ResolvedPat<'tcx> {
 
 #[derive(Clone, Copy, Debug)]
 enum ResolvedPatKind<'tcx> {
-    Path { res: Res, pat_res: Res, segments: &'tcx [hir::PathSegment<'tcx>] },
-    Struct { variant: &'tcx VariantDef },
-    TupleStruct { res: Res, variant: &'tcx VariantDef },
+    Path {
+        res: Res,
+        pat_res: Res,
+        segments: &'tcx [hir::PathSegment<'tcx>],
+        qself_ty_hir_id: Option<HirId>,
+    },
+    Struct {
+        variant: &'tcx VariantDef,
+    },
+    TupleStruct {
+        res: Res,
+        variant: &'tcx VariantDef,
+    },
+    TupleStructInfer {
+        variant_ident: Option<Ident>,
+        qself_ty_hir_id: Option<HirId>,
+    },
+    StructInfer {
+        variant_ident: Option<Ident>,
+        qself_ty_hir_id: Option<HirId>,
+    },
 }
 
 impl<'tcx> ResolvedPat<'tcx> {
@@ -317,6 +335,15 @@ impl<'tcx> ResolvedPat<'tcx> {
             // These constants can be of a reference type, e.g. `const X: &u8 = &0;`.
             // Peeling the reference types too early will cause type checking failures.
             // Although it would be possible to *also* peel the types of the constants too.
+            AdjustMode::Pass
+        } else if let ResolvedPatKind::Path { res: Res::Infer, .. } = self.kind {
+            // For inferred paths, we don't know the type yet, so pass through
+            AdjustMode::Pass
+        } else if matches!(
+            self.kind,
+            ResolvedPatKind::TupleStructInfer { .. } | ResolvedPatKind::StructInfer { .. }
+        ) {
+            // For inferred patterns, we don't know the type yet, so pass through
             AdjustMode::Pass
         } else {
             // The remaining possible resolutions for path, struct, and tuple struct patterns are
@@ -604,7 +631,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             PatKind::Expr(PatExpr { kind: PatExprKind::Path(_), hir_id, .. }) => {
                 let ty = match opt_path_res.unwrap() {
                     Ok(ref pr) => {
-                        self.check_pat_path(pat.hir_id, pat.span, pr, expected, &pat_info.top_info)
+                        self.check_pat_path(*hir_id, pat.span, pr, expected, &pat_info.top_info)
                     }
                     Err(guar) => Ty::new_error(self.tcx, guar),
                 };
@@ -623,6 +650,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .check_pat_tuple_struct(
                         pat, qpath, subpats, ddpos, res, ty, variant, expected, pat_info,
                     ),
+                Ok(ResolvedPat {
+                    kind: ResolvedPatKind::TupleStructInfer { variant_ident, qself_ty_hir_id },
+                    ..
+                }) => self.check_pat_tuple_struct_infer(
+                    pat,
+                    qpath,
+                    subpats,
+                    ddpos,
+                    variant_ident,
+                    qself_ty_hir_id,
+                    expected,
+                    pat_info,
+                ),
                 Err(guar) => {
                     let ty_err = Ty::new_error(self.tcx, guar);
                     for subpat in subpats {
@@ -643,6 +683,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         expected,
                         pat_info,
                     ),
+                Ok(ResolvedPat {
+                    kind: ResolvedPatKind::StructInfer { variant_ident, qself_ty_hir_id },
+                    ..
+                }) => self.check_pat_struct_infer(
+                    pat,
+                    fields,
+                    has_rest_pat.is_some(),
+                    variant_ident,
+                    qself_ty_hir_id,
+                    expected,
+                    pat_info,
+                ),
                 Err(guar) => {
                     let ty_err = Ty::new_error(self.tcx, guar);
                     for field in fields {
@@ -1513,8 +1565,39 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         pat: &'tcx Pat<'tcx>,
         qpath: &hir::QPath<'tcx>,
     ) -> Result<ResolvedPat<'tcx>, ErrorGuaranteed> {
+        let tcx = self.tcx;
+
+        // Check if this is an inferred path (.Variant { ... } syntax)
+        let is_infer = match qpath {
+            hir::QPath::Resolved(_, path) => path.res == Res::Infer,
+            hir::QPath::TypeRelative(qself_ty, _) => {
+                matches!(qself_ty.kind, hir::TyKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Infer)
+            }
+        };
+
+        if is_infer {
+            let variant_ident = match qpath {
+                hir::QPath::Resolved(_, path) => path
+                    .segments
+                    .iter()
+                    .find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+                    .map(|seg| seg.ident),
+                hir::QPath::TypeRelative(_, segment) => Some(segment.ident),
+            };
+
+            let qself_ty_hir_id = match qpath {
+                hir::QPath::TypeRelative(qself_ty, _) => Some(qself_ty.hir_id),
+                _ => None,
+            };
+
+            return Ok(ResolvedPat {
+                ty: tcx.types.unit,
+                kind: ResolvedPatKind::StructInfer { variant_ident, qself_ty_hir_id },
+            });
+        }
+
         // Resolve the path and check the definition for errors.
-        let (variant, pat_ty) = self.check_struct_path(qpath, pat.hir_id)?;
+        let (variant, pat_ty) = self.check_struct_path(qpath, pat.hir_id, None)?;
         Ok(ResolvedPat { ty: pat_ty, kind: ResolvedPatKind::Struct { variant } })
     }
 
@@ -1545,6 +1628,35 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         qpath: &'tcx hir::QPath<'_>,
     ) -> Result<ResolvedPat<'tcx>, ErrorGuaranteed> {
         let tcx = self.tcx;
+
+        let is_infer = match qpath {
+            hir::QPath::Resolved(_, path) => path.res == Res::Infer,
+            hir::QPath::TypeRelative(qself_ty, _) => {
+                matches!(qself_ty.kind, hir::TyKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Infer)
+            }
+        };
+
+        if is_infer {
+            // Get qself_ty_hir_id for TypeRelative paths
+            let qself_ty_hir_id = match qpath {
+                hir::QPath::TypeRelative(qself_ty, _) => Some(qself_ty.hir_id),
+                _ => None,
+            };
+
+            return Ok(ResolvedPat {
+                // Use unit type as placeholder - actual type resolved later based on expected type
+                ty: tcx.types.unit,
+                kind: ResolvedPatKind::Path {
+                    res: Res::Infer,
+                    pat_res: Res::Infer,
+                    segments: match qpath {
+                        hir::QPath::Resolved(_, path) => path.segments,
+                        hir::QPath::TypeRelative(_, seg) => std::slice::from_ref(*seg),
+                    },
+                    qself_ty_hir_id,
+                },
+            });
+        }
 
         let (res, opt_ty, segments) =
             self.resolve_ty_and_res_fully_qualified_call(qpath, path_id, span);
@@ -1592,7 +1704,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Find the type of the path pattern, for later checking.
         let (pat_ty, pat_res) =
             self.instantiate_value_path(segments, opt_ty, res, span, span, path_id);
-        Ok(ResolvedPat { ty: pat_ty, kind: ResolvedPatKind::Path { res, pat_res, segments } })
+        Ok(ResolvedPat {
+            ty: pat_ty,
+            kind: ResolvedPatKind::Path { res, pat_res, segments, qself_ty_hir_id: None },
+        })
     }
 
     fn check_pat_path(
@@ -1603,6 +1718,83 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected: Ty<'tcx>,
         ti: &TopInfo<'tcx>,
     ) -> Ty<'tcx> {
+        let ResolvedPatKind::Path { res, pat_res: _, segments, qself_ty_hir_id } = resolved.kind
+        else {
+            span_bug!(span, "unexpected resolution for path pattern: {resolved:?}");
+        };
+
+        if res == Res::Infer {
+            let expected_ty = self.try_structurally_resolve_type(span, expected);
+
+            // Write type for privacy checker
+            if let Some(qself_hir_id) = qself_ty_hir_id {
+                self.write_ty(qself_hir_id, expected_ty);
+            }
+
+            // Get the variant name from segments
+            let variant_name = segments
+                .iter()
+                .find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+                .map(|seg| seg.ident);
+
+            let Some(variant_ident) = variant_name else {
+                let err = self.dcx().span_err(span, "expected variant name after `.`");
+                return Ty::new_error(self.tcx, err);
+            };
+
+            let Some(adt_def) = expected_ty.ty_adt_def() else {
+                let err = self.dcx().span_err(
+                    span,
+                    format!("expected enum type for `.{}`, found `{}`", variant_ident, expected_ty),
+                );
+                return Ty::new_error(self.tcx, err);
+            };
+
+            if !adt_def.is_enum() {
+                let err = self.dcx().span_err(
+                    span,
+                    format!(
+                        "expected enum type for `.{}`, found struct `{}`",
+                        variant_ident, expected_ty
+                    ),
+                );
+                return Ty::new_error(self.tcx, err);
+            }
+
+            // Look for matching variant
+            for variant in adt_def.variants() {
+                if variant.name == variant_ident.name {
+                    // Check it's a unit variant for pattern matching
+                    if variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Const) {
+                        // Write the resolution for downstream passes
+                        self.write_resolution(
+                            pat_id_for_diag,
+                            Ok((
+                                DefKind::Ctor(CtorOf::Variant, CtorKind::Const),
+                                variant.ctor_def_id().unwrap(),
+                            )),
+                        );
+                        return expected_ty;
+                    } else {
+                        let err = self.dcx().span_err(
+                            span,
+                            format!(
+                                "expected unit variant, found tuple or struct variant `{}`",
+                                variant_ident
+                            ),
+                        );
+                        return Ty::new_error(self.tcx, err);
+                    }
+                }
+            }
+
+            let err = self.dcx().span_err(
+                variant_ident.span,
+                format!("no variant named `{}` found for enum `{}`", variant_ident, expected_ty),
+            );
+            return Ty::new_error(self.tcx, err);
+        }
+
         if let Err(err) =
             self.demand_suptype_with_origin(&self.pattern_cause(ti, span), expected, resolved.ty)
         {
@@ -1646,7 +1838,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         pat_span: Span,
         resolved_pat: &ResolvedPat<'tcx>,
     ) {
-        let ResolvedPatKind::Path { res, pat_res, segments } = resolved_pat.kind else {
+        let ResolvedPatKind::Path { res, pat_res, segments, .. } = resolved_pat.kind else {
             span_bug!(pat_span, "unexpected resolution for path pattern: {resolved_pat:?}");
         };
 
@@ -1726,6 +1918,39 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let e = report_unexpected_variant_res(tcx, res, None, qpath, pat.span, E0164, expected);
             Err(e)
         };
+
+        // Check if this is an inferred path (.Variant syntax)
+        let is_infer = match qpath {
+            hir::QPath::Resolved(_, path) => path.res == Res::Infer,
+            hir::QPath::TypeRelative(qself_ty, _) => {
+                matches!(qself_ty.kind, hir::TyKind::Path(hir::QPath::Resolved(_, path)) if path.res == Res::Infer)
+            }
+        };
+
+        if is_infer {
+            // Get variant name from qpath
+            let variant_ident = match qpath {
+                hir::QPath::Resolved(_, path) => path
+                    .segments
+                    .iter()
+                    .find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+                    .map(|seg| seg.ident),
+                hir::QPath::TypeRelative(_, segment) => Some(segment.ident),
+            };
+
+            // Get qself_ty_hir_id for TypeRelative paths
+            let qself_ty_hir_id = match qpath {
+                hir::QPath::TypeRelative(qself_ty, _) => Some(qself_ty.hir_id),
+                _ => None,
+            };
+
+            // Return placeholder - actual resolution in check_pat_tuple_struct
+            // Use unit type as placeholder - actual type resolved later based on expected type
+            return Ok(ResolvedPat {
+                ty: tcx.types.unit,
+                kind: ResolvedPatKind::TupleStructInfer { variant_ident, qself_ty_hir_id },
+            });
+        }
 
         // Resolve the path and check the definition for errors.
         let (res, opt_ty, segments) =
@@ -1821,6 +2046,200 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return Ty::new_error(tcx, e);
         }
         pat_ty
+    }
+
+    /// Check a tuple struct pattern with inferred type (.Variant(...) syntax)
+    fn check_pat_tuple_struct_infer(
+        &self,
+        pat: &'tcx Pat<'tcx>,
+        qpath: &'tcx hir::QPath<'tcx>,
+        subpats: &'tcx [Pat<'tcx>],
+        ddpos: hir::DotDotPos,
+        variant_ident: Option<Ident>,
+        qself_ty_hir_id: Option<HirId>,
+        expected: Ty<'tcx>,
+        pat_info: PatInfo<'tcx>,
+    ) -> Ty<'tcx> {
+        let tcx = self.tcx;
+        let expected_ty = self.try_structurally_resolve_type(pat.span, expected);
+
+        // Write type for privacy checker
+        if let Some(qself_hir_id) = qself_ty_hir_id {
+            self.write_ty(qself_hir_id, expected_ty);
+        }
+
+        let Some(variant_ident) = variant_ident else {
+            let err = self.dcx().span_err(pat.span, "expected variant name after `.`");
+            for subpat in subpats {
+                self.check_pat(subpat, Ty::new_error(tcx, err), pat_info);
+            }
+            return Ty::new_error(tcx, err);
+        };
+
+        let Some(adt_def) = expected_ty.ty_adt_def() else {
+            let err = self.dcx().span_err(
+                pat.span,
+                format!("expected enum type for `.{}`, found `{}`", variant_ident, expected_ty),
+            );
+            for subpat in subpats {
+                self.check_pat(subpat, Ty::new_error(tcx, err), pat_info);
+            }
+            return Ty::new_error(tcx, err);
+        };
+
+        if !adt_def.is_enum() {
+            let err = self.dcx().span_err(
+                pat.span,
+                format!(
+                    "expected enum type for `.{}`, found struct `{}`",
+                    variant_ident, expected_ty
+                ),
+            );
+            for subpat in subpats {
+                self.check_pat(subpat, Ty::new_error(tcx, err), pat_info);
+            }
+            return Ty::new_error(tcx, err);
+        }
+
+        let Some(variant) = adt_def.variants().iter().find(|v| v.name == variant_ident.name) else {
+            let err = self.dcx().span_err(
+                variant_ident.span,
+                format!("no variant named `{}` found for enum `{}`", variant_ident, expected_ty),
+            );
+            for subpat in subpats {
+                self.check_pat(subpat, Ty::new_error(tcx, err), pat_info);
+            }
+            return Ty::new_error(tcx, err);
+        };
+
+        if variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Fn) {
+            self.write_resolution(
+                pat.hir_id,
+                Ok((DefKind::Ctor(CtorOf::Variant, CtorKind::Fn), variant.ctor_def_id().unwrap())),
+            );
+
+            let res = Res::Def(
+                DefKind::Ctor(CtorOf::Variant, CtorKind::Fn),
+                variant.ctor_def_id().unwrap(),
+            );
+            return self.check_pat_tuple_struct(
+                pat,
+                qpath,
+                subpats,
+                ddpos,
+                res,
+                expected_ty,
+                variant,
+                expected,
+                pat_info,
+            );
+        }
+
+        let err = self.dcx().span_err(
+            pat.span,
+            format!("expected tuple variant, found unit or struct variant `{}`", variant_ident),
+        );
+        for subpat in subpats {
+            self.check_pat(subpat, Ty::new_error(tcx, err), pat_info);
+        }
+        return Ty::new_error(tcx, err);
+    }
+
+    /// Check a struct pattern with inferred type (.Variant { ... } syntax)
+    fn check_pat_struct_infer(
+        &self,
+        pat: &'tcx Pat<'tcx>,
+        fields: &'tcx [hir::PatField<'tcx>],
+        has_rest_pat: bool,
+        variant_ident: Option<Ident>,
+        qself_ty_hir_id: Option<HirId>,
+        expected: Ty<'tcx>,
+        pat_info: PatInfo<'tcx>,
+    ) -> Ty<'tcx> {
+        let tcx = self.tcx;
+        let expected_ty = self.try_structurally_resolve_type(pat.span, expected);
+
+        // Write type for qself if present (for TypeRelative paths, needed by privacy checker)
+        if let Some(qself_hir_id) = qself_ty_hir_id {
+            self.write_ty(qself_hir_id, expected_ty);
+        }
+
+        // Get variant name - if None, it's `.{ ... }` for struct literal
+        let is_struct_literal = variant_ident.is_none();
+
+        // Check if expected type is an ADT
+        let Some(adt_def) = expected_ty.ty_adt_def() else {
+            let msg = if is_struct_literal {
+                format!("expected struct type for `.{{ ... }}`, found `{}`", expected_ty)
+            } else {
+                format!(
+                    "expected enum type for `.{}`, found `{}`",
+                    variant_ident.unwrap(),
+                    expected_ty
+                )
+            };
+            let err = self.dcx().span_err(pat.span, msg);
+            for field in fields {
+                self.check_pat(field.pat, Ty::new_error(tcx, err), pat_info);
+            }
+            return Ty::new_error(tcx, err);
+        };
+
+        let variant = if is_struct_literal {
+            // `.{ ... }` - expect a struct
+            if !adt_def.is_struct() {
+                let err = self.dcx().span_err(
+                    pat.span,
+                    format!("expected struct type for `.{{ ... }}`, found enum `{}`", expected_ty),
+                );
+                for field in fields {
+                    self.check_pat(field.pat, Ty::new_error(tcx, err), pat_info);
+                }
+                return Ty::new_error(tcx, err);
+            }
+            self.write_resolution(pat.hir_id, Ok((DefKind::Struct, adt_def.did())));
+            adt_def.non_enum_variant()
+        } else {
+            // `.Variant { ... }` - expect an enum
+            let variant_ident = variant_ident.unwrap();
+            if !adt_def.is_enum() {
+                let err = self.dcx().span_err(
+                    pat.span,
+                    format!(
+                        "expected enum type for `.{}`, found struct `{}`",
+                        variant_ident, expected_ty
+                    ),
+                );
+                for field in fields {
+                    self.check_pat(field.pat, Ty::new_error(tcx, err), pat_info);
+                }
+                return Ty::new_error(tcx, err);
+            }
+
+            // Look for matching variant
+            match adt_def.variants().iter().find(|v| v.name == variant_ident.name) {
+                Some(variant) => {
+                    self.write_resolution(pat.hir_id, Ok((DefKind::Variant, variant.def_id)));
+                    variant
+                }
+                None => {
+                    let err = self.dcx().span_err(
+                        variant_ident.span,
+                        format!(
+                            "no variant named `{}` found for enum `{}`",
+                            variant_ident, expected_ty
+                        ),
+                    );
+                    for field in fields {
+                        self.check_pat(field.pat, Ty::new_error(tcx, err), pat_info);
+                    }
+                    return Ty::new_error(tcx, err);
+                }
+            }
+        };
+
+        // Delegate to normal check_pat_struct
+        self.check_pat_struct(pat, fields, has_rest_pat, expected_ty, variant, expected, pat_info)
     }
 
     fn emit_err_pat_wrong_number_of_fields(

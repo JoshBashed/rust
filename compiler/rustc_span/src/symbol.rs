@@ -36,6 +36,7 @@ symbols! {
         //
         // tidy-alphabetical-start
         DollarCrate:        "$crate",
+        InferRoot:          "{{infer}}",
         PathRoot:           "{{root}}",
         Underscore:         "_",
         // tidy-alphabetical-end
@@ -3094,6 +3095,7 @@ impl Symbol {
             || self == kw::Crate
             || self == kw::PathRoot
             || self == kw::DollarCrate
+            || self == kw::InferRoot
     }
 
     /// Returns `true` if the symbol is `true` or `false`.

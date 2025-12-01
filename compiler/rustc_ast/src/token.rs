@@ -660,7 +660,8 @@ impl Token {
             Lt | Shl                          | // associated path
             PathSep                           | // global path
             Lifetime(..)                      | // labeled loop
-            Pound                             => true, // expression attributes
+            Pound                             | // expression attributes
+            Dot                               => true, // inferred type
             OpenInvisible(InvisibleOrigin::MetaVar(
                 MetaVarKind::Block |
                 MetaVarKind::Expr { .. } |
@@ -886,6 +887,7 @@ impl Token {
 
     pub fn is_path_start(&self) -> bool {
         self.kind == PathSep
+            || self.kind == Dot
             || self.is_qpath_start()
             || matches!(self.is_metavar_seq(), Some(MetaVarKind::Path))
             || self.is_path_segment_keyword()

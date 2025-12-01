@@ -1275,6 +1275,54 @@ impl<'tcx> ThirBuildCx<'tcx> {
 
             Res::Local(var_hir_id) => self.convert_var(var_hir_id),
 
+            Res::Infer => {
+                let ty = self.typeck_results.node_type(expr.hir_id);
+
+                let ty::Adt(adt_def, args) = ty.kind() else {
+                    span_bug!(expr.span, "Res::Infer with unexpected type: {:?}", ty);
+                };
+
+                let variant_name = match &expr.kind {
+                    hir::ExprKind::Path(qpath) => match qpath {
+                        hir::QPath::Resolved(_, path) => path
+                            .segments
+                            .iter()
+                            .find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+                            .map(|seg| seg.ident.name),
+                        hir::QPath::TypeRelative(_, segment) => Some(segment.ident.name),
+                    },
+                    _ => None,
+                };
+
+                let Some(variant_name) = variant_name else {
+                    span_bug!(
+                        expr.span,
+                        "could not find variant for inferred path with type {:?}",
+                        ty
+                    );
+                };
+                let Some(variant) = adt_def.variants().iter().find(|v| v.name == variant_name)
+                else {
+                    span_bug!(
+                        expr.span,
+                        "could not find variant for inferred path with type {:?}",
+                        ty
+                    );
+                };
+
+                let user_provided_types = self.typeck_results.user_provided_types();
+                let user_ty = user_provided_types.get(expr.hir_id).copied().map(Box::new);
+                let variant_index = adt_def.variant_index_with_id(variant.def_id);
+                ExprKind::Adt(Box::new(AdtExpr {
+                    adt_def: *adt_def,
+                    variant_index,
+                    args,
+                    user_ty,
+                    fields: Box::new([]),
+                    base: AdtExprBase::None,
+                }))
+            }
+
             _ => span_bug!(expr.span, "res `{:?}` not yet implemented", res),
         }
     }
