@@ -814,11 +814,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         //
         // If additional_segment is present, it means that the path was TypeRelative, and we should
         // use the additional segment as the variant name.
-        let variant_ident = if let Some(additional_segment) = additional_segment {
-            Some(additional_segment.ident)
+        let variant_segment = if let Some(additional_segment) = additional_segment {
+            Some(additional_segment)
         } else {
-            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot).map(|seg| seg.ident)
+            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot)
         };
+        let variant_ident = variant_segment.map(|seg| seg.ident);
 
         let Some(expected_ty) = expected else {
             let err = self.dcx().span_err(path_span, "cannot infer type; type annotation required");
@@ -852,6 +853,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             self.write_resolution(hir_id, Ok((DefKind::Struct, adt_def.did())));
 
+            for seg in path.segments.iter() {
+                if seg.args.is_some() {
+                    self.lowerer().lower_generic_args_of_path_segment(
+                        seg.ident.span,
+                        adt_def.did(),
+                        seg,
+                    );
+                }
+            }
+
             return Ok(Some((adt_def.non_enum_variant(), expected_ty)));
         };
 
@@ -864,6 +875,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 ));
             };
             self.write_resolution(hir_id, Ok((DefKind::Variant, variant.def_id)));
+
+            if let Some(seg) = variant_segment {
+                if seg.args.is_some() {
+                    self.lowerer().lower_generic_args_of_path_segment(
+                        seg.ident.span,
+                        adt_def.did(),
+                        seg,
+                    );
+                }
+            }
 
             return Ok(Some((variant, expected_ty)));
         }
