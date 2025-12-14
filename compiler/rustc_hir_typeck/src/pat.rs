@@ -336,15 +336,6 @@ impl<'tcx> ResolvedPat<'tcx> {
             // Peeling the reference types too early will cause type checking failures.
             // Although it would be possible to *also* peel the types of the constants too.
             AdjustMode::Pass
-        } else if let ResolvedPatKind::Path { res: Res::Infer, .. } = self.kind {
-            // For inferred paths, we don't know the type yet, so pass through
-            AdjustMode::Pass
-        } else if matches!(
-            self.kind,
-            ResolvedPatKind::TupleStructInfer { .. } | ResolvedPatKind::StructInfer { .. }
-        ) {
-            // For inferred patterns, we don't know the type yet, so pass through
-            AdjustMode::Pass
         } else {
             // The remaining possible resolutions for path, struct, and tuple struct patterns are
             // ADT constructors. As such, we may peel references freely, but we must not peel the
@@ -2164,7 +2155,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.write_ty(qself_hir_id, expected_ty);
         }
 
-        // Get variant name - if None, it's `.{ ... }` for struct literal
         let is_struct_literal = variant_ident.is_none();
 
         // Check if expected type is an ADT
@@ -2186,7 +2176,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         let variant = if is_struct_literal {
-            // `.{ ... }` - expect a struct
+            // `.{ ... }`
             if !adt_def.is_struct() {
                 let err = self.dcx().span_err(
                     pat.span,
@@ -2200,7 +2190,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self.write_resolution(pat.hir_id, Ok((DefKind::Struct, adt_def.did())));
             adt_def.non_enum_variant()
         } else {
-            // `.Variant { ... }` - expect an enum
+            // `.Variant { ... }`
             let variant_ident = variant_ident.unwrap();
             if !adt_def.is_enum() {
                 let err = self.dcx().span_err(
