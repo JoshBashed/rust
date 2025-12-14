@@ -784,7 +784,27 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ));
         };
 
+        // Get the variant segment from path segments.
+        //
+        // If additional_segment is present, it means that the path was TypeRelative, and we should
+        // use the additional segment as the variant segment.
+        let variant_segment = if let Some(additional_segment) = additional_segment {
+            Some(additional_segment)
+        } else {
+            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot)
+        };
+        let variant_ident = variant_segment.map(|seg| seg.ident);
+
         if adt_def.is_struct() {
+            if let Some(ident) = variant_ident {
+                return Err(self.dcx().span_err(
+                    ident.span,
+                    format!(
+                        "structs do not have variants, found variant name `{}` for struct `{}`",
+                        expected_ty, ident
+                    ),
+                ));
+            }
             return Ok(Some(expected_ty));
         } else if !adt_def.is_enum() {
             return Err(self.dcx().span_err(
@@ -792,16 +812,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 format!("expected enum or struct type, found `{}`", expected_ty),
             ));
         }
-
-        // Get the variant name from path segments.
-        //
-        // If additional_segment is present, it means that the path was TypeRelative, and we should
-        // use the additional segment as the variant name.
-        let variant_ident = if let Some(additional_segment) = additional_segment {
-            Some(additional_segment.ident)
-        } else {
-            path.segments.iter().find(|seg| seg.ident.name != kw::InferRoot).map(|seg| seg.ident)
-        };
 
         let Some(variant_ident) = variant_ident else {
             // It might be a struct with tuple struct constructor syntax.
@@ -838,6 +848,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 format!("no variant named `{}` found for enum `{}`", variant_ident, expected_ty),
             ));
         };
+
+        if let Some(seg) = variant_segment {
+            if seg.args.is_some() {
+                self.lowerer().lower_generic_args_of_path_segment(
+                    seg.ident.span,
+                    adt_def.did(),
+                    seg,
+                );
+            }
+        }
 
         if variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Const) {
             let Some(ctor_def_id) = variant.ctor_def_id() else {
