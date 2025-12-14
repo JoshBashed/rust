@@ -7,6 +7,7 @@ use rustc_hir::def::{self, CtorKind, Namespace, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, HirId, LangItem};
 use rustc_hir_analysis::autoderef::Autoderef;
+use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_infer::infer::BoundRegionConversionTime;
 use rustc_infer::traits::{Obligation, ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::adjustment::{
@@ -245,6 +246,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             );
             return Some(Ty::new_misc_error(tcx));
         };
+
+        if let Some(seg) = match qpath {
+            hir::QPath::Resolved(_, path) => {
+                path.segments.iter().find(|seg| seg.ident.name != rustc_span::symbol::kw::InferRoot)
+            }
+            hir::QPath::TypeRelative(_, segment) => Some(*segment),
+        } {
+            if seg.args.is_some() {
+                self.lowerer().lower_generic_args_of_path_segment(
+                    seg.ident.span,
+                    adt_def.did(),
+                    seg,
+                );
+            }
+        }
 
         if !variant.ctor.is_some_and(|(kind, _)| kind == CtorKind::Fn) {
             self.dcx().span_err(
